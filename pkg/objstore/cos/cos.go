@@ -4,6 +4,7 @@
 package cos
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"github.com/mozillazg/go-cos"
 	"github.com/pkg/errors"
 	"github.com/thanos-io/thanos/pkg/objstore"
@@ -24,6 +26,8 @@ import (
 
 // DirDelim is the delimiter used to model a directory structure in an object store bucket.
 const dirDelim = "/"
+
+const maxSinglePutObjectSize = 5 * 1024 * 1024 * 1024  // 5 GiB, limit from COS
 
 // Bucket implements the store.Bucket interface against cos-compatible(Tencent Object Storage) APIs.
 type Bucket struct {
@@ -94,6 +98,20 @@ func (b *Bucket) Name() string {
 	return b.name
 }
 
+func (b *Bucket) guessFileSize(name string, r io.Reader) int64 {
+	if f, ok := r.(*os.File); ok {
+		fileInfo, err := f.Stat()
+		if err == nil {
+			return fileInfo.Size()
+		}
+		level.Warn(b.logger).Log("msg", "could not stat file for multipart upload", "name", name, "err", err)
+		return -1
+	}
+
+	level.Warn(b.logger).Log("msg", "could not guess file size for multipart upload", "name", name)
+	return -1
+}
+
 // Attributes returns information about the specified object.
 func (b *Bucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
 	resp, err := b.client.Object.Head(ctx, name, nil)
@@ -121,8 +139,44 @@ func (b *Bucket) Attributes(ctx context.Context, name string) (objstore.ObjectAt
 
 // Upload the contents of the reader as an object into the bucket.
 func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader) error {
-	if _, err := b.client.Object.Put(ctx, name, r, nil); err != nil {
-		return errors.Wrap(err, "upload cos object")
+	fileSize := b.guessFileSize(name, r)
+	if fileSize > int64(maxSinglePutObjectSize) {
+		level.Debug(b.logger).Log("msg", "upload cos object: use multi part load")
+		up, _, err := b.client.Object.InitiateMultipartUpload(ctx, name, nil)
+		if err != nil {
+			return errors.Wrap(err, "upload cos object: init multi part load")
+		}
+		buf := make([]byte, 1*1024*1024*1024) // 1 Gib
+		partNum := 1
+		opt := &cos.CompleteMultipartUploadOptions{}
+		for {
+			n, err := r.Read(buf)
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				_, _ = b.client.Object.AbortMultipartUpload(ctx, name, up.UploadID)
+				return errors.Wrap(err, "upload cos object: reading a part of object")
+			}
+			part := bytes.NewBuffer(buf[:n])
+			resp, err := b.client.Object.UploadPart(ctx, name, up.UploadID, partNum, part, nil)
+			if err != nil {
+				_, _ = b.client.Object.AbortMultipartUpload(ctx, name, up.UploadID)
+				return errors.Wrap(err, "upload cos object: uploading a part of object")
+			}
+			opt.Parts = append(opt.Parts, cos.Object{
+				ETag:       resp.Header.Get("Etag"),
+				PartNumber: partNum,
+			})
+			partNum += 1
+		}
+		_, completeResp, err := b.client.Object.CompleteMultipartUpload(ctx, name, up.UploadID, opt)
+		level.Debug(b.logger).Log("msg", "upload cos object: upload completed", "status", completeResp.Status)
+
+	} else {
+		if _, err := b.client.Object.Put(ctx, name, r, nil); err != nil {
+			return errors.Wrap(err, "upload cos object")
+		}
 	}
 	return nil
 }
